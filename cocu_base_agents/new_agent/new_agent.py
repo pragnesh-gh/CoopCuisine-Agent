@@ -58,7 +58,18 @@ def _top_name_from_content_list(clist) -> str | None:
     if isinstance(clist[0], dict):
         return _extract_item_name(clist[0])
     return None
-
+def _orders_signature(state):
+    """
+    Build a stable signature of the active orders, left→right.
+    Prefer an order id if present; fall back to meal+index.
+    """
+    orders = state.get("orders") or state.get("order_state") or []
+    sig = []
+    for i, o in enumerate(orders):
+        oid = o.get("id") or o.get("order_id") or o.get("uid")
+        meal = (o.get("meal") or o.get("name") or "").lower()
+        sig.append(oid or f"{meal}#{i}")
+    return tuple(sig)
 # ──────────────────────────────────────────────────────────────────────────────
 # Agent
 # ──────────────────────────────────────────────────────────────────────────────
@@ -66,6 +77,9 @@ class BTAgent(BaseAgent):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._initialized = False
+        self.prev_orders_sig = None
+        self._last_put_was_serve = False
+        self.serving_id = None
 
     def _pick_leftmost_order_meal(self, state) -> str:
         """
@@ -104,7 +118,14 @@ class BTAgent(BaseAgent):
 
         # Build positions map
         counters = state.get("counters", [])
+        service = next((c for c in counters if (c.get("type") or "").lower() == "servingwindow"), None)
+        if service is None:
+            raise RuntimeError("No serving window found")
+        self.serving_id = service["id"]
         self.counter_positions = {c["id"]: np.array(c["pos"]) for c in counters}
+
+        # Cache initial orders signature
+        self.prev_orders_sig = _orders_signature(state)
 
         # Set initial active meal
         BB.active_meal = self._pick_leftmost_order_meal(state)
@@ -220,38 +241,111 @@ class BTAgent(BaseAgent):
     async def manage_tasks(self, state):
         # tick counter for debounce
         BB.tick = getattr(BB, "tick", 0) + 1
+        BB.last_state = state
 
+        # ─────────────────────────────────────────────────────────────────────────
+        # Helper (local) : stable signature of orders left→right
+        # ─────────────────────────────────────────────────────────────────────────
+        def _orders_signature(st):
+            orders = st.get("orders") or st.get("order_state") or []
+            sig = []
+            for i, o in enumerate(orders):
+                oid = o.get("id") or o.get("order_id") or o.get("uid")
+                meal = (o.get("meal") or o.get("name") or "").lower()
+                sig.append(oid or f"{meal}#{i}")
+            return tuple(sig)
+
+        # ─────────────────────────────────────────────────────────────────────────
         # 0) META_COOK has absolute priority
+        # ─────────────────────────────────────────────────────────────────────────
         if getattr(BB, "meta_waiting", None):
             status = self._handle_meta_cook_poll(state)
             if status == TaskStatus.IN_PROGRESS:
                 return
             # if DONE/FAILED, allow new scheduling below
 
+        # ─────────────────────────────────────────────────────────────────────────
+        # Init on first call of new fields we use for multi-order continuity
+        # ─────────────────────────────────────────────────────────────────────────
+        if not hasattr(self, "prev_orders_sig"):
+            self.prev_orders_sig = _orders_signature(state)
+        if not hasattr(self, "_last_put_was_serve"):
+            self._last_put_was_serve = False
+
+        # Find serving window id (for final-serve edge detection)
+        serving_id = None
+        counters = state.get("counters", [])
+        if isinstance(counters, list):
+            for c in counters:
+                if (c.get("type") or "").lower() == "servingwindow":
+                    serving_id = c.get("id");
+                    break
+
+        # ─────────────────────────────────────────────────────────────────────────
+        # A) If we served on the previous tick but orders UI hasn't updated yet,
+        #    proactively reset & rebuild once (keeps agent from idling).
+        #    Do this BEFORE inflight check so we can immediately start next order.
+        # ─────────────────────────────────────────────────────────────────────────
+        if self._last_put_was_serve:
+            self._last_put_was_serve = False
+            print("[BTAgent] ✅ Served last tick → proactive reset & rebuild")
+            self._reset_per_order_state()
+            BB.active_meal = self._pick_leftmost_order_meal(state)
+            self._build_tree(state)
+            if not BB.active_meal:
+                print("[BTAgent]    no active order after serve; idling")
+                return
+
+        # ─────────────────────────────────────────────────────────────────────────
+        # B) If the orders list changed (length/front order), rebuild even if the
+        #    next meal string is identical (Burger → Burger back-to-back).
+        # ─────────────────────────────────────────────────────────────────────────
+        new_sig = _orders_signature(state)
+        if new_sig != self.prev_orders_sig:
+            self.prev_orders_sig = new_sig
+            print("[BTAgent] 🔁 Orders changed → reset & rebuild")
+            self._reset_per_order_state()
+            BB.active_meal = self._pick_leftmost_order_meal(state)
+            self._build_tree(state)
+            if not BB.active_meal:
+                print("[BTAgent]    no active order after rebuild; idling")
+                return
+
+        # ─────────────────────────────────────────────────────────────────────────
         # 1) If a task is inflight, wait
+        # ─────────────────────────────────────────────────────────────────────────
         if self.current_task is not None:
             print("[BTAgent]    skipping, waiting on in-flight task")
             return
 
-        # 2) Recompute active meal from left-most order each tick
+        # ─────────────────────────────────────────────────────────────────────────
+        # 2) Recompute active meal from left-most order each tick (still keep this
+        #    for the simple "meal switched" case; complements the signature check)
+        # ─────────────────────────────────────────────────────────────────────────
         current_meal = self._pick_leftmost_order_meal(state)
         if current_meal != getattr(BB, "active_meal", ""):
             # Either new order arrived, or old one finished → rebuild
-            print(f"[BTAgent] 🔁 Meal switched: {getattr(BB,'active_meal','')} → {current_meal}")
+            print(f"[BTAgent] 🔁 Meal switched: {getattr(BB, 'active_meal', '')} → {current_meal}")
             BB.active_meal = current_meal
             self._reset_per_order_state()
             self._build_tree(state)
 
+        # ─────────────────────────────────────────────────────────────────────────
         # 3) If no tree or no active orders, idle
+        # ─────────────────────────────────────────────────────────────────────────
         if not getattr(self, "tree", None) or not current_meal:
             print("[BTAgent]    no active order; idling")
             return
 
+        # ─────────────────────────────────────────────────────────────────────────
         # 4) Drive BT
+        # ─────────────────────────────────────────────────────────────────────────
         print("[BTAgent]    ticking behavior tree")
         self.tree.tick()
 
+        # ─────────────────────────────────────────────────────────────────────────
         # 5) Schedule emitted task
+        # ─────────────────────────────────────────────────────────────────────────
         next_task = getattr(BB, "next_task", None)
         if not next_task:
             print("[BTAgent]    no new task, idling")
@@ -270,9 +364,14 @@ class BTAgent(BaseAgent):
             del BB.next_task
             return
 
+        # Final-serve edge detection: remember if we are about to PUT to serving window
+        if task_type == "PUT" and serving_id is not None and task_arg == serving_id:
+            self._last_put_was_serve = True
+
         # Plate PUT debounce (prevents pick-back immediately after place)
         if task_type == "PUT":
             target_id = task_arg
+
             if getattr(BB, "plate_spot_id", None) and target_id == BB.plate_spot_id:
                 last_tick = getattr(BB, "last_plate_put_tick", -999)
                 if (BB.tick - last_tick) <= 1 and not getattr(BB, "allow_pick_plate_once", False):
@@ -282,6 +381,14 @@ class BTAgent(BaseAgent):
                 BB.last_plate_put_tick = BB.tick
                 if getattr(BB, "allow_pick_plate_once", False):
                     BB.allow_pick_plate_once = False
+            basket_home = getattr(BB, "tool_home", {}).get("basket")  # where the basket lives (the fryer id)
+            if basket_home and target_id == basket_home:
+                last_tick = getattr(BB, "last_fryer_put_tick", -999)
+                if (BB.tick - last_tick) <= 1:
+                    print("[BTAgent] ⏭️ debounced: skipping immediate second PUT on fryer.")
+                    del BB.next_task
+                    return
+                BB.last_fryer_put_tick = BB.tick
 
         self.set_current_task(Task(task_type, task_args=task_arg, task_status=TaskStatus.SCHEDULED))
         del BB.next_task
