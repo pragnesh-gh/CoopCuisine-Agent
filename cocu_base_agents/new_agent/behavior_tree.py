@@ -7,36 +7,36 @@ from py_trees import blackboard
 # Blackboard (shared scratchpad between leaves and the agent loop)
 # ──────────────────────────────────────────────────────────────────────────────
 BB = blackboard.Blackboard()
-# We’ll store:
-# - BB.next_task:    ("GOTO"/"PUT"/"INTERACT"/"META_COOK", payload)
-# - BB.plate_spot_id: counter id where we staged the plate
-# - BB.cb_index:     round‑robin index for cutting boards
-# - BB.tool_home:    { "pan": stove_id, "pot": stove_id, "basket": fryer_id, "peel": oven_id }
+# BB fields we use:
+# - next_task:        ("GOTO"/"PUT"/"INTERACT"/"META_COOK", payload)
+# - plate_spot_id:    counter id where we staged the plate
+# - cb_index:         round-robin index for cutting boards
+# - tool_home:        { "pan": stove_id, "pot": stove_id }
+# - added_to_plate:   set of tokens already placed (for gating cold additions)
+# - active_meal:      current target meal name (e.g., "burgers", "tomatosoup")
+# - last_meal:        last built meal name (used by the agent to rebuild)
+# - allow_pick_plate_once: bool one-shot gate to avoid immediate double PUT
 
-# // NEW: helpers used by the (agent-side) META_COOK logic; harmless to keep here too
-def _norm_name(s: str | None) -> str:
-    """Normalize names like 'CookedPatty', 'cooked_patty', 'cookedpatty' -> 'cookedpatty'."""
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def _norm(s: str | None) -> str:
     return (s or "").lower().replace("_", "")
 
 def _lookup_counter(state: dict, counter_id: str) -> dict | None:
-    """
-    Find a counter dict by id in the current state payload.
-    Assumes state["counters"] is either a dict[id]->counter or a list[ {id:..., ...}, ... ].
-    """
-    counters = state.get("counters")
-    if isinstance(counters, dict):
-        return counters.get(counter_id)
-    if isinstance(counters, list):
-        for c in counters:
+    cs = state.get("counters")
+    if isinstance(cs, dict):
+        return cs.get(counter_id)
+    if isinstance(cs, list):
+        for c in cs:
             if c.get("id") == counter_id:
                 return c
     return None
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Leaf behaviours (each leaf emits exactly one Task into BB.next_task)
+# Leaf behaviours — emit exactly one Task into BB.next_task
 # ──────────────────────────────────────────────────────────────────────────────
-class GoToBehaviour(py_trees.behaviour.Behaviour):
+class GoTo(py_trees.behaviour.Behaviour):
     def __init__(self, name: str, target_pos):
         super().__init__(name); self.target_pos = target_pos
     def update(self):
@@ -44,8 +44,7 @@ class GoToBehaviour(py_trees.behaviour.Behaviour):
         BB.next_task = ("GOTO", np.array(self.target_pos))
         return py_trees.common.Status.SUCCESS
 
-
-class PutBehaviour(py_trees.behaviour.Behaviour):
+class Put(py_trees.behaviour.Behaviour):
     def __init__(self, name: str, target_id: str):
         super().__init__(name); self.target_id = target_id
     def update(self):
@@ -53,8 +52,7 @@ class PutBehaviour(py_trees.behaviour.Behaviour):
         BB.next_task = ("PUT", self.target_id)
         return py_trees.common.Status.SUCCESS
 
-
-class InteractBehaviour(py_trees.behaviour.Behaviour):
+class Interact(py_trees.behaviour.Behaviour):
     def __init__(self, name: str, counter_id: str):
         super().__init__(name); self.counter_id = counter_id
     def update(self):
@@ -62,387 +60,311 @@ class InteractBehaviour(py_trees.behaviour.Behaviour):
         BB.next_task = ("INTERACT", self.counter_id)
         return py_trees.common.Status.SUCCESS
 
-
-class MetaCookBehaviour(py_trees.behaviour.Behaviour):
-    """
-    Ask the BaseAgent to wait for a particular cooked product to appear at `station_id`.
-    The agent’s META_COOK handler should interpret the payload as (required_product_base, station_id).
-    """
+class MetaCook(py_trees.behaviour.Behaviour):
+    """Ask BaseAgent to wait for a cooked product to appear at station_id."""
     def __init__(self, name: str, required_product: str, station_id: str):
         super().__init__(name); self.required_product = required_product; self.station_id = station_id
     def update(self):
         print(f"[BT][MetaCook] → scheduling META_COOK station={self.station_id} wait_for={self.required_product}")
-        BB.next_task = ("META_COOK", (self.required_product, self.station_id))
+        BB.next_task = ("META_COOK", (_norm(self.required_product), self.station_id))
         return py_trees.common.Status.SUCCESS
 
-
-# NEW ↓↓↓ — record “this ingredient is now on the plate”
 class MarkPlateAddition(py_trees.behaviour.Behaviour):
     def __init__(self, name: str, token: str):
-        super().__init__(name); self.token = token
+        super().__init__(name); self.token = _norm(token)
     def update(self):
         if not hasattr(BB, "added_to_plate"):
             BB.added_to_plate = set()
-        BB.added_to_plate.add(_norm_name(self.token))
+        BB.added_to_plate.add(self.token)
         print(f"[BT][Mark] → recorded on plate: {self.token}")
         return py_trees.common.Status.SUCCESS
 
-
-# NEW ↓↓↓ — gate: run child only if token missing from plate
 class IfTokenMissing(py_trees.behaviour.Behaviour):
     def __init__(self, name: str, token: str):
-        super().__init__(name); self.token = token
+        super().__init__(name); self.token = _norm(token)
     def update(self):
-        present = _norm_name(self.token) in getattr(BB, "added_to_plate", set())
+        present = self.token in getattr(BB, "added_to_plate", set())
         return py_trees.common.Status.FAILURE if present else py_trees.common.Status.SUCCESS
 
-class AllowPickPlateOnce(py_trees.behaviour.Behaviour):
-    def __init__(self, name: str = "AllowPickPlateOnce"):
-        super().__init__(name)
-    def update(self):
-        BB.allow_pick_plate_once = True
-        print("[BT][Serve] → allow one pick from plate spot")
-        return py_trees.common.Status.SUCCESS
-
-# ──────────────────────────────────────────────────────────────────────────────
-# OneShotAction: fire child once; on first SUCCESS, return RUNNING to consume a tick
-# ──────────────────────────────────────────────────────────────────────────────
-class OneShotAction(py_trees.decorators.Decorator):
+# OneShot wrapper: on first SUCCESS, report RUNNING to consume a tick
+class OneShot(py_trees.decorators.Decorator):
     def __init__(self, name: str, child: py_trees.behaviour.Behaviour):
-        super().__init__(name=name, child=child); self.triggered = False
+        super().__init__(name=name, child=child)
+        self.triggered = False
     def update(self):
-        self.decorated.tick(); status = self.decorated.status
+        self.decorated.tick()
+        status = self.decorated.status
         if not self.triggered and status == py_trees.common.Status.SUCCESS:
-            self.triggered = True; return py_trees.common.Status.RUNNING
+            self.triggered = True
+            return py_trees.common.Status.RUNNING
         return status
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# BehaviorTreeBuilder — utensil-aware cooking, multi-board chopping, soup gating
+# Builder
 # ──────────────────────────────────────────────────────────────────────────────
 class BehaviorTreeBuilder:
+    """
+    Hand-crafted BT with 3 branches: TomatoSoup / Salad / Burger.
+
+    We assume:
+    - `id_map.ID_MAP` provides explicit IDs for dispensers, boards, serving window,
+      and the *specific* stove used for pan vs pot.
+    - `counter_positions` is a mapping id -> np.array([x,y]).
+    - `state["orders"]` lists active orders left→right; we take the left-most.
+    """
     @staticmethod
-    def build(recipe_graphs,
-              service_counter_id: str,
-              counters: list,
+    def build(state: dict,
               counter_positions: dict,
-              player_key: str):
-
-        root = py_trees.composites.Selector(name="RootSelector", memory=False)
-
-        # ---------- Index the world ----------
-        by_type = {}
-        for c in counters:
-            ctype = (c.get("type") or "").lower()
-            by_type.setdefault(ctype, []).append(c)
-        print(f"[BTBuilder] COUNTER_TYPES: {sorted(by_type.keys())}")
-
-        def ids_of(type_key: str):
-            ids = [c["id"] for c in by_type.get(type_key.lower(), [])]
-            print(f"[BTBuilder] ids_of('{type_key}') -> {ids}")
-            return ids
-
-        def first_or_none(seq):
-            return seq[0] if seq else None
+              id_map_module) -> py_trees.trees.BehaviourTree:
+        from importlib import reload
+        id_map = reload(id_map_module).ID_MAP if hasattr(id_map_module, "ID_MAP") else {}
 
         def pos_of(cid: str):
             return counter_positions.get(cid)
 
-        # add helpers to a sequence
-        def add_goto(seq, cid):
-            pos = pos_of(cid)
-            if pos is None:
-                print(f"[BTBuilder] ⚠️ Missing position for {cid}; skipping GOTO"); return
-            seq.add_child(OneShotAction(f"Action_Goto_{cid}",
-                         Retry(f"Retry_Goto_{cid}", GoToBehaviour(f"Goto_{cid}", pos), 3)))
+        # index counters by type for fallbacks (keeps your original “free plate spot” behavior)
+        counters = state.get("counters", [])
+        by_type = {}
+        for c in counters:
+            ctype = (c.get("type") or "").lower()
+            by_type.setdefault(ctype, []).append(c)
 
-        def add_put(seq, cid):
-            seq.add_child(OneShotAction(f"Action_Put_{cid}",
-                         Retry(f"Retry_Put_{cid}", PutBehaviour(f"Put_{cid}", cid), 3)))
+        def first_id_of(t: str) -> str | None:
+            xs = by_type.get(t.lower(), [])
+            return xs[0]["id"] if xs else None
 
-        def add_interact(seq, cid):
-            seq.add_child(OneShotAction(f"Action_Interact_{cid}",
-                         Retry(f"Retry_Interact_{cid}", InteractBehaviour(f"Interact_{cid}", cid), 3)))
+        # ——— Pull important IDs (prefer id_map, fallback to type search) ———
+        plate_src = id_map.get("plate_dispenser") or first_id_of("platedispenser") or first_id_of("plate")
+        serving   = id_map.get("serving_window") or first_id_of("servingwindow")
+        cutting_boards = list(id_map.get("cutting_boards", [])) or [c["id"] for c in by_type.get("cuttingboard", [])]
 
-        def add_meta_cook(seq, required, station):
-            seq.add_child(OneShotAction(f"Action_MetaCook_{station}",
-                         Retry(f"Retry_MetaCook_{station}", MetaCookBehaviour(f"Cook_{station}", required, station), 3)))
+        tomato_disp  = id_map.get("tomato_dispenser")  or first_id_of("tomatodispenser")  or first_id_of("tomato_dispenser")
+        lettuce_disp = id_map.get("lettuce_dispenser") or first_id_of("lettucedispenser") or first_id_of("lettuce_dispenser")
+        bun_disp     = id_map.get("bun_dispenser")     or first_id_of("bundispenser")     or first_id_of("bun_dispenser")
+        meat_disp    = id_map.get("meat_dispenser")    or first_id_of("meatdispenser")    or first_id_of("meat_dispenser")
 
-        def add_mark(seq, token):
-            seq.add_child(OneShotAction(f"Action_Mark_{token}",
-                                        MarkPlateAddition(f"Mark_{token}", token)))
-        # ---------- Recipe parsing helpers ----------
-        def base(node_name: str) -> str:
-            return node_name.split("_", 1)[0]  # "Tomato_abc" -> "Tomato"
+        stove_pan = id_map.get("stove_pan")  # REQUIRED for burger patty
+        stove_pot = id_map.get("stove_pot")  # REQUIRED for tomato soup
 
-        def type_for_node(node: str) -> str | None:
-            """
-            Map a recipe node to a counter 'type' string reported by the env.
-            Tries both 'x_dispenser' and 'xdispenser'. Special-cases plate/board/stations.
-            """
-            b = base(node).lower()
-            if b == "cuttingboard":
-                return "cuttingboard"
-            if b == "plate":
-                if "platedispenser" in by_type: return "platedispenser"
-                if "plate" in by_type:          return "plate"
-                return None
-            if b in ("stove", "oven", "deepfryer"):
-                return b
-            # ingredients (dispenser names have no underscore in Co-op Cuisine)
-            underscored = f"{b}_dispenser"
-            squashed    = f"{b}dispenser"
-            if underscored in by_type: return underscored
-            if squashed    in by_type: return squashed
-            return None
+        # fallback: if specific stove not provided, use first stove
+        stove_pan = stove_pan or (by_type.get("stove", [{}])[0].get("id") if by_type.get("stove") else None)
+        stove_pot = stove_pot or stove_pan
 
-        # choose a cutting board (round‑robin)
-        cuttingboard_ids_all = ids_of("cuttingboard")
+        # maintain round-robin over cutting boards
+        if not cutting_boards:
+            print("[BTBuilder] ⚠️ No cutting boards found")
         BB.cb_index = 0
-        def pick_board() -> str | None:
-            if not cuttingboard_ids_all: return None
-            cid = cuttingboard_ids_all[BB.cb_index % len(cuttingboard_ids_all)]
+        def pick_board():
+            if not cutting_boards: return None
+            cid = cutting_boards[BB.cb_index % len(cutting_boards)]
             BB.cb_index += 1
             return cid
 
-        # stage a plate on a plain counter (once per order sequence)
-        plate_spot_candidates = ids_of("counter")
+        # ——— stage a plate on a free Counter spot (preserve your original behavior) ———
         def ensure_plate_staged(seq) -> bool:
             if getattr(BB, "plate_spot_id", None):
                 return True
-            plate_src = first_or_none(ids_of("platedispenser")) or first_or_none(ids_of("plate"))
-            spot      = first_or_none(plate_spot_candidates)
+            # pick any plain counter as staging spot
+            counter_spots = [c["id"] for c in by_type.get("counter", [])]
+            spot = (id_map.get("plate_staging_counter") or (counter_spots[0] if counter_spots else None))
             if not plate_src or not spot:
-                print(f"[BTBuilder] ⚠️ Missing plate source ({plate_src}) or counter spot ({spot})"); return False
+                print(f"[BTBuilder] ⚠️ Missing plate source ({plate_src}) or staging spot ({spot})")
+                return False
             BB.plate_spot_id = spot
-            print(f"[BTBuilder] Staging plate at counter spot: {BB.plate_spot_id}")
-            add_goto(seq, plate_src); add_put(seq, plate_src)   # pick plate
-            add_goto(seq, spot);      add_put(seq, spot)        # drop plate
+            print(f"[BTBuilder] Staging plate at counter: {BB.plate_spot_id}")
+            # pick plate → drop on spot
+            _add_goto(seq, plate_src); _add_put(seq, plate_src)
+            _add_goto(seq, spot);      _add_put(seq, spot)
             return True
 
-        # Tool ↔ Station mapping + “home”
-        TOOL_TO_STATION = {
-            "pan": "stove",
-            "pot": "stove",
-            "basket": "deepfryer",
-            "peel": "oven",
-        }
-        if not hasattr(BB, "tool_home"):
-            BB.tool_home = {}  # tool_type -> station_id it lives on
+        # ——— tiny DSL for adding leaves with Retry + OneShot ———
+        def _add_goto(seq, cid):
+            p = pos_of(cid)
+            if p is None:
+                print(f"[BTBuilder] ⚠️ Missing position for {cid}; skipping GOTO"); return
+            seq.add_child(OneShot(f"Action_Goto_{cid}",
+                                  Retry(f"Retry_Goto_{cid}", GoTo(f"Goto_{cid}", p), 3)))
+        def _add_put(seq, cid):
+            seq.add_child(OneShot(f"Action_Put_{cid}",
+                                  Retry(f"Retry_Put_{cid}", Put(f"Put_{cid}", cid), 3)))
+        def _add_interact(seq, cid):
+            seq.add_child(OneShot(f"Action_Interact_{cid}",
+                                  Retry(f"Retry_Interact_{cid}", Interact(f"Interact_{cid}", cid), 3)))
+        def _add_cook_wait(seq, required, station_id):
+            seq.add_child(OneShot(f"Action_MetaCook_{station_id}",
+                                  Retry(f"Retry_MetaCook_{station_id}", MetaCook(f"Cook_{station_id}", required, station_id), 3)))
+        def _mark(seq, token):
+            seq.add_child(OneShot(f"Action_Mark_{token}", MarkPlateAddition(f"Mark_{token}", token)))
 
-        # Given a tool keyword (pan/pot/basket/peel), pick a station id to use (and remember as home)
-        def pick_station_for_tool(tool_key: str) -> str | None:
-            station_type = TOOL_TO_STATION.get(tool_key)
-            if not station_type: return None
-            sts = ids_of(station_type)
-            if not sts: return None
-            station_id = BB.tool_home.get(tool_key) or sts[0]
-            BB.tool_home[tool_key] = station_id
-            return station_id
+        # ——— selectors for meals: we’ll add *one* sequence depending on active order ———
+        root = py_trees.composites.Selector(name="Root", memory=False)
 
-        # Tiny edge helpers
-        def next_dst(edges, node):
-            # first edge whose src == node
-            for s, d in edges:
-                if s == node:
-                    return d
-            return None
+        meal = _norm(getattr(BB, "active_meal", ""))  # set by agent based on left-most order
+        print(f"[BTBuilder] Building for meal: {meal!r}")
 
-        # ---------- Build one sequence per meal ----------
-        for graph in recipe_graphs:
-            meal = graph.get("meal", "Meal")
-            raw_edges = list(graph.get("edges", []))
+        # Always ensure we track plate additions per order
+        BB.added_to_plate = set()
 
-            # topological order by edge dependency (edge u before v if u.dst == v.src)
-            n = len(raw_edges)
-            adj, indeg = {i: [] for i in range(n)}, {i: 0 for i in range(n)}
-            for i, (s1, d1) in enumerate(raw_edges):
-                for j, (s2, _) in enumerate(raw_edges):
-                    if d1 == s2: adj[i].append(j); indeg[j] += 1
-            q, order = [i for i in range(n) if indeg[i] == 0], []
-            while q:
-                u = q.pop(0); order.append(u)
-                for v in adj[u]:
-                    indeg[v] -= 1
-                    if indeg[v] == 0: q.append(v)
-            if len(order) != n: order = list(range(n))
-            edges = [raw_edges[i] for i in order]
+        # =============== TOMATO SOUP BRANCH ===============
+        if meal == "tomatosoup":
+            seq = py_trees.composites.Sequence(name="TomatoSoup", memory=True)
+            ensure_plate_staged(seq)
 
-            # // CHANGED: Keep only process edges (boards/tools/stations) to avoid double PUTs on plates
-            PROC = ("cuttingboard", "pan", "pot", "basket", "peel", "stove", "oven", "deepfryer")
-            process_edges = [e for e in edges if base(e[1]).lower() in PROC]
-            edges_ord     = process_edges  # ← CHANGED
+            # 3× (tomato → board → chop → pick → pot at stove_pot)
+            for i in range(3):
+                board = pick_board()
+                if not (tomato_disp and board and stove_pot):
+                    print("[BTBuilder] ⚠️ Soup missing tomato/board/stove_pot id")
+                    break
+                _add_goto(seq, tomato_disp);
+                _add_put(seq, tomato_disp)  # pick tomato from dispenser
+                _add_goto(seq, board);
+                _add_put(seq, board)  # place tomato on cutting board
+                _add_interact(seq, board)  # chop tomato
+                _add_put(seq, board)  # pick up chopped tomato
+                _add_goto(seq, stove_pot);
+                _add_put(seq, stove_pot)  # drop chopped tomato into pot (on stove)
 
-            seq = py_trees.composites.Sequence(name=f"Order_{meal}_UTENSILS", memory=True)
-            print(f"[BTBuilder] BUILDING {meal}: edges = {edges_ord}")
+            # Start cooking and wait for soup
+            if stove_pot:
+                _add_interact(seq, stove_pot)  # start cooking (interact stove)
+                _add_cook_wait(seq, "tomatosoup", stove_pot)  # wait until soup ready (META_COOK)
+                # Pour to plate
+                _add_put(seq, stove_pot)  # pick pot (with soup)
+                if getattr(BB, "plate_spot_id", None):
+                    _add_goto(seq, BB.plate_spot_id);
+                    _add_put(seq, BB.plate_spot_id)  # pour onto plate
+                    _mark(seq, "tomatosoup")  # mark soup added
+                _add_goto(seq, stove_pot);
+                _add_put(seq, stove_pot)  # return empty pot
 
-            ensure_plate_staged(seq)  # stage plate once
-
-            # NEW ↓↓↓ — cold (direct-to-plate) additions like Bun, Cheese, etc.
-            if not hasattr(BB, "added_to_plate"):
-                BB.added_to_plate = set()
-
-            cold_items = []
-            for s, d in edges:  # use full graph, not filtered edges_ord
-                if base(d).lower() == "plate":
-                    src_base = base(s)
-                    low = src_base.lower()
-                    if low.startswith("chopped") or low.startswith("cooked"):
-                        continue  # handled elsewhere
-                    dtype = type_for_node(s)  # e.g., 'bundispenser'
-                    if dtype and dtype.endswith("dispenser"):
-                        cold_items.append((_norm_name(src_base), dtype))
-
-            if cold_items:
-                cold_selector = py_trees.composites.Selector(name=f"{meal}_ColdAdditions", memory=False)
-                for token, disp_type in cold_items:
-                    disp_id = first_or_none(ids_of(disp_type))
-                    if not disp_id:
-                        print(f"[BTBuilder] ⚠️ No ids for dispenser type {disp_type}; skipping cold item '{token}'")
-                        continue
-                    if token == "bun":
-                        continue
-                    cold_seq = py_trees.composites.Sequence(name=f"Cold_{token}", memory=True)
-                    # gate: only run if token not on plate yet
-                    cold_seq.add_child(IfTokenMissing(f"Need_{token}", token))
-                    # make sure plate is staged (no-op if already done)
-                    ensure_plate_staged(cold_seq)
-                    # fetch → plate → mark
-                    add_goto(cold_seq, disp_id);            add_put(cold_seq, disp_id)
-                    if getattr(BB, "plate_spot_id", None):
-                        add_goto(cold_seq, BB.plate_spot_id); add_put(cold_seq, BB.plate_spot_id)
-                        add_mark(cold_seq, token)
-                    cold_selector.add_child(cold_seq)
-
-                # Put cold additions BEFORE the main utensil sequence
-                root.add_child(cold_selector)
-
-
-            for src, dst in edges_ord:
-                src_b, dst_b = base(src).lower(), base(dst).lower()
-
-                # ── 1) Ingredient -> CuttingBoard (chop, free board) ──────────────────────
-                if dst_b == "cuttingboard":
-                    ing_type = type_for_node(src)
-                    board_id = pick_board()
-                    if ing_type and board_id:
-                        ing_id = first_or_none(ids_of(ing_type))
-                        if not ing_id:
-                            print(f"[BTBuilder] ⚠️ No ids for dispenser type {ing_type}; skipping")
-                            continue
-                        # pick ingredient → place on board → chop → pick chopped (frees board)
-                        add_goto(seq, ing_id);
-                        add_put(seq, ing_id)
-                        add_goto(seq, board_id);
-                        add_put(seq, board_id)
-                        add_interact(seq, board_id)
-                        add_put(seq, board_id)
-
-                        # look-ahead: produced node after board, then next action target
-                        produced_node = next_dst(edges, dst)  # e.g., RawPatty_* or ChoppedTomato_*
-                        nxt = next_dst(edges, produced_node) if produced_node else None
-                        nxt_b = base(nxt).lower() if nxt else None
-
-                        # If cooking is next (tool/station), branch into cooking pipeline now.
-                        if nxt_b in ("pan", "pot", "basket", "peel", "stove", "oven", "deepfryer"):
-                            # resolve final station (skip tool layer if present)
-                            tool_or_station = nxt
-                            tool_b = nxt_b
-                            station_node = (tool_or_station if tool_b in ("stove", "oven", "deepfryer")
-                                            else next_dst(edges, tool_or_station))
-                            station_type = type_for_node(station_node) if station_node else None
-                            if not station_type:
-                                print(f"[BTBuilder] ⚠️ Could not resolve station for {station_node}; skipping")
-                            else:
-                                # Decide which physical station to use (and treat it as tool home)
-                                if tool_b in TOOL_TO_STATION:
-                                    station_id = pick_station_for_tool(tool_b)
-                                else:
-                                    st_ids = ids_of(station_type)
-                                    station_id = st_ids[0] if st_ids else None
-                                if station_id:
-                                    # drop prepped item into utensil at station → cook → wait → pour → return utensil
-                                    add_goto(seq, station_id);
-                                    add_put(seq, station_id)  # place item into utensil
-                                    add_interact(seq, station_id)  # start cooking
-                                    cooked_node = next_dst(edges, station_node) if station_node else None
-                                    required = base(cooked_node).lower() if cooked_node else "cooked"
-                                    add_meta_cook(seq, required, station_id)  # wait for done
-                                    add_put(seq, station_id)  # pick utensil (with food)
-                                    if getattr(BB, "plate_spot_id", None):
-                                        add_goto(seq, BB.plate_spot_id)
-                                        add_put(seq, BB.plate_spot_id)  # pour to plate
-                                        # ✅ mark the **cooked** item as added (e.g., 'cookedpatty')
-                                        add_mark(seq, _norm_name(required))
-                                    add_goto(seq, station_id)
-                                    add_put(seq, station_id)  # return empty utensil
-                                    continue  # handled fully
-
-                        # else (no cooking next): assemble directly on the staged plate spot
-                        if getattr(BB, "plate_spot_id", None):
-                            add_goto(seq, BB.plate_spot_id);
-                            add_put(seq, BB.plate_spot_id)
-                            # ✅ mark the **chopped** result as added (e.g., 'choppedtomato'/'choppedlettuce')
-                            if produced_node:
-                                add_mark(seq, _norm_name(base(produced_node)))
-                    else:
-                        print(f"[BTBuilder] ⚠️ Missing ing_type or board for {src}->{dst}; skipping")
-                    continue
-
-                # ── 2) Tool/Prepped -> Station (safety path if graphs give these earlier) ──
-                if dst_b in ("pan", "pot", "basket", "peel", "stove", "oven", "deepfryer"):
-                    # infer final station, and which tool (if any) this implies
-                    tool_b = dst_b if dst_b in TOOL_TO_STATION else None
-                    station_node = dst if dst_b in ("stove", "oven", "deepfryer") else next_dst(edges, dst)
-                    station_type = type_for_node(station_node) if station_node else None
-                    if not station_type:
-                        print(f"[BTBuilder] ⚠️ Could not resolve station for {station_node}; skipping")
-                        continue
-                    station_id = (pick_station_for_tool(tool_b) if tool_b
-                                  else (ids_of(station_type)[0] if ids_of(station_type) else None))
-                    if not station_id:
-                        print(f"[BTBuilder] ⚠️ No station id available for {station_type}; skipping")
-                        continue
-                    add_goto(seq, station_id); add_put(seq, station_id)     # place item into utensil
-                    add_interact(seq, station_id)                           # start cooking
-                    cooked_node = next_dst(edges, station_node) if station_node else None
-                    required = base(cooked_node).lower() if cooked_node else "cooked"
-                    add_meta_cook(seq, required, station_id)
-                    add_put(seq, station_id)                                # pick utensil with food
-                    if getattr(BB, "plate_spot_id", None):
-                        add_goto(seq, BB.plate_spot_id); add_put(seq, BB.plate_spot_id)  # pour
-                    add_goto(seq, station_id); add_put(seq, station_id)     # return utensil
-                    continue
-
-                # (Plate edges deliberately ignored)       # // CHANGED: removed Sections 3 & 4 to stop double PUTs
-
-                # else: ignore unhandled edges (e.g., decorations)
-
-            # ── Serve: pick plate from its spot → serving window → drop ────────────────────
-            if getattr(BB, "plate_spot_id", None) and service_counter_id in counter_positions:
-                add_goto(seq, BB.plate_spot_id);   add_put(seq, BB.plate_spot_id)    # pick final plate
-                add_goto(seq, service_counter_id); add_put(seq, service_counter_id)  # serve
-
+            # Serve the plate
+            if getattr(BB, "plate_spot_id", None) and serving in counter_positions:
+                _add_goto(seq, BB.plate_spot_id);
+                _add_put(seq, BB.plate_spot_id)  # pick plate
+                _add_goto(seq, serving);
+                _add_put(seq, serving)  # deliver to window
             root.add_child(seq)
-            # === Add bun LAST (after all chopped/cooked items are on the plate) ===
-            has_bun_edge = any(base(s).lower() == "bun" and base(d).lower() == "plate" for s, d in edges)
-            if has_bun_edge:
-                bun_id = first_or_none(ids_of("bundispenser"))
-                if not bun_id:
-                    print("[BTBuilder] ⚠️ No 'bundispenser' found; cannot add bun last.")
-                elif not getattr(BB, "plate_spot_id", None):
-                    print("[BTBuilder] ⚠️ No plate_spot_id; cannot add bun last.")
-                else:
-                    bun_last = py_trees.composites.Sequence(name=f"{meal}_AddBunLast", memory=True)
-                    bun_last.add_child(IfTokenMissing("Need_bun", "bun"))  # skip if bun already on plate
-                    add_goto(bun_last, bun_id);
-                    add_put(bun_last, bun_id)
-                    add_goto(bun_last, BB.plate_spot_id);
-                    add_put(bun_last, BB.plate_spot_id)
-                    add_mark(bun_last, "bun")
-                    root.add_child(bun_last)
+
+
+        # =============== SALAD BRANCH ===============
+        elif meal == "salad":
+            seq = py_trees.composites.Sequence(name="Salad", memory=True)
+            ensure_plate_staged(seq)
+
+            # Tomato → chop → pick → plate
+            board_t = pick_board()
+            if tomato_disp and board_t:
+                _add_goto(seq, tomato_disp);
+                _add_put(seq, tomato_disp)  # pick tomato from dispenser
+                _add_goto(seq, board_t);
+                _add_put(seq, board_t)  # place tomato on cutting board
+                _add_interact(seq, board_t)  # chop tomato
+                _add_put(seq, board_t)  # pick up chopped tomato
+                if getattr(BB, "plate_spot_id", None):
+                    _add_goto(seq, BB.plate_spot_id);
+                    _add_put(seq, BB.plate_spot_id)  # place on plate
+                    _mark(seq, "choppedtomato")  # mark recorded
+
+            # Lettuce → chop → pick → plate
+            board_l = pick_board()
+            if lettuce_disp and board_l:
+                _add_goto(seq, lettuce_disp);
+                _add_put(seq, lettuce_disp)  # pick lettuce from dispenser
+                _add_goto(seq, board_l);
+                _add_put(seq, board_l)  # place lettuce on cutting board
+                _add_interact(seq, board_l)  # chop lettuce
+                _add_put(seq, board_l)  # pick up chopped lettuce
+                if getattr(BB, "plate_spot_id", None):
+                    _add_goto(seq, BB.plate_spot_id);
+                    _add_put(seq, BB.plate_spot_id)  # place on plate
+                    _mark(seq, "choppedlettuce")  # mark recorded
+
+            # serve
+            if getattr(BB, "plate_spot_id", None) and serving in counter_positions:
+                _add_goto(seq, BB.plate_spot_id); _add_put(seq, BB.plate_spot_id)
+                _add_goto(seq, serving);          _add_put(seq, serving)
+            root.add_child(seq)
+
+        # =============== BURGER BRANCH ===============
+        elif meal == "burger":
+            seq = py_trees.composites.Sequence(name="Burger", memory=True)
+            ensure_plate_staged(seq)
+
+            # Lettuce → board → chop → pick → plate
+            board_l = pick_board()
+            if lettuce_disp and board_l:
+                _add_goto(seq, lettuce_disp);
+                _add_put(seq, lettuce_disp)  # pick lettuce
+                _add_goto(seq, board_l);
+                _add_put(seq, board_l)  # place on board
+                _add_interact(seq, board_l)  # chop lettuce
+                _add_put(seq, board_l)  # pick chopped lettuce
+                if getattr(BB, "plate_spot_id", None):
+                    _add_goto(seq, BB.plate_spot_id);
+                    _add_put(seq, BB.plate_spot_id)  # place on plate
+                    _mark(seq, "choppedlettuce")
+
+            # Tomato → board → chop → pick → plate
+            board_t = pick_board()
+            if tomato_disp and board_t:
+                _add_goto(seq, tomato_disp);
+                _add_put(seq, tomato_disp)  # pick tomato
+                _add_goto(seq, board_t);
+                _add_put(seq, board_t)  # place on board
+                _add_interact(seq, board_t)  # chop tomato
+                _add_put(seq, board_t)  # pick chopped tomato
+                if getattr(BB, "plate_spot_id", None):
+                    _add_goto(seq, BB.plate_spot_id);
+                    _add_put(seq, BB.plate_spot_id)  # place on plate
+                    _mark(seq, "choppedtomato")
+
+            # Meat → board → chop → pick → pan → cook → pour → return pan
+            board_m = pick_board()
+            if meat_disp and board_m and stove_pan:
+                _add_goto(seq, meat_disp);
+                _add_put(seq, meat_disp)  # pick meat
+                _add_goto(seq, board_m);
+                _add_put(seq, board_m)  # place on board
+                _add_interact(seq, board_m)  # chop → raw patty
+                _add_put(seq, board_m)  # pick raw patty
+                _add_goto(seq, stove_pan);
+                _add_put(seq, stove_pan)  # put patty into pan on stove
+                _add_interact(seq, stove_pan)  # start cooking
+                _add_cook_wait(seq, "cookedpatty", stove_pan)  # wait till cooked
+                _add_put(seq, stove_pan)  # pick pan (with patty)
+                if getattr(BB, "plate_spot_id", None):
+                    _add_goto(seq, BB.plate_spot_id);
+                    _add_put(seq, BB.plate_spot_id)  # pour patty on plate
+                    _mark(seq, "cookedpatty")
+                _add_goto(seq, stove_pan);
+                _add_put(seq, stove_pan)  # return empty pan
+
+            # Bun LAST → pick → plate
+            if bun_disp and getattr(BB, "plate_spot_id", None):
+                # NOTE: bun step stays INSIDE the same sequence, AFTER all other toppings.
+                _add_goto(seq, bun_disp);
+                _add_put(seq, bun_disp)  # pick bun
+                _add_goto(seq, BB.plate_spot_id);
+                _add_put(seq, BB.plate_spot_id)  # place bun on plate
+                _mark(seq, "bun")  # mark bun added
+
+            # Serve the plate
+            if getattr(BB, "plate_spot_id", None) and serving in counter_positions:
+                _add_goto(seq, BB.plate_spot_id);
+                _add_put(seq, BB.plate_spot_id)  # pick plate
+                _add_goto(seq, serving);
+                _add_put(seq, serving)  # deliver to window
+
+            # Attach ONLY the main seq to root (no separate bun child!)
+            root.add_child(seq)
+
+
+
+        else:
+            # No active meal → idle leaf so we don't spam logs
+            class Idle(py_trees.behaviour.Behaviour):
+                def update(self): return py_trees.common.Status.RUNNING
+            root.add_child(Idle("Idle_NoActiveMeal"))
 
         return py_trees.trees.BehaviourTree(root)
-
-
-
