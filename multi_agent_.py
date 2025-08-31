@@ -1,5 +1,11 @@
+# Declaration:
+# This program is the result of combined work between a human developer 
+# and ChatGPT. The AI contributed helpers, initial structures, and 
+# formatting improvements. The human developer contributed the 
+# high-level design, behavior tree logic, and integration of ideas. 
+# The final implementation is a product of human–AI collaboration.
+
 # cocu_base_agents/new_agent/multi_agent.py
-# NOTE: file is a copy of your new_agent.py with minimal additions for multi-agent coordination.
 # Goal of this file: run two+ agents safely together, avoid tool-stealing, and serialize recipes that need exclusive gear.
 
 import os
