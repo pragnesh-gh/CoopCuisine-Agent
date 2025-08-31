@@ -1,0 +1,216 @@
+plates:
+  clean_plates: 6
+  dirty_plates: 0
+  plate_delay: [ 5, 10 ]
+  return_dirty: false
+  # range of seconds until the dirty plate arrives.
+
+game:
+  time_limit_seconds: 180
+  undo_dispenser_pickup: true
+  validate_recipes: true
+
+
+layout_chars:
+  _: Free
+  hash: Counter  # #
+  equal: EdgeCounter  # =
+  A: Agent
+  pipe: Extinguisher
+  P: PlateDispenser
+  C: CuttingBoard
+  X: Trashcan
+  $: ServingWindow
+  S: Sink
+  +: SinkAddon
+  at: Plate  # @ just a clean plate on a counter
+  U: Pot  # with Stove
+  Q: Pan  # with Stove
+  O: Peel  # with Oven
+  F: Basket  # with DeepFryer
+  T: Tomato
+  N: Onion  # oNioN
+  L: Lettuce
+  K: Potato  # Kartoffel
+  I: Fish  # fIIIsh
+  D: Dough
+  E: Cheese  # chEEEse
+  G: Sausage  # sausaGe
+  B: Bun
+  M: Meat
+  question: Counter  # ? mushroom
+  ↓: ConveyerDown
+  ^: ConveyerUp
+  right: ConveyerRight
+  left: ConveyerLeft
+  wave: Water  # ~ Water
+  minus: Ice  # - Ice
+  exclamation: Lava  # ! Lave
+  dquote: Counter  # " wall/truck
+  p: Counter # second plate return ??
+  star: Target  # * Target
+
+
+orders:
+  meals:
+    all: true
+  order_gen_class: !!python/name:cooperative_cuisine.orders.DeterministicOrderGeneration ''
+  # the class to that receives the kwargs. Should be a child class of OrderGeneration in orders.py
+  order_gen_kwargs:
+    # structure: [meal_name, start, duration] (start and duration as seconds or timedeltas https://github.com/wroberts/pytimeparse)
+    timed_orders:
+      # - [Burger, 0:00, 1:30]
+      # - [Pizza, 0:00, 1:30]
+      # - [Burger, 1:30, 1:30]
+      # - [Pizza, 1:30, 1:30]
+      # - [Pizza, 3:00, 1:30]
+      # - [Burger, 3:00, 1:30]
+      # - [Pizza, 4:30, 1:30]
+      # - [Burger, 4:30, 1:30]
+      - [Burger, 0:00, 1:30]
+      - [Salad, 0:00, 1:30]
+      - [Burger, 1:30, 1:30]
+      - [Salad, 1:30, 1:30]
+      - [Salad, 3:00, 1:30]
+      - [Burger, 3:00, 1:30]
+      - [Salad, 4:30, 1:30]
+      - [Burger, 4:30, 1:30]
+    never_no_order: True
+    never_no_order_update_all_remaining: True
+  serving_not_ordered_meals: null
+
+
+player_config:
+  radius: 0.4
+  speed_units_per_seconds: 7
+  interaction_range: 1.25
+  restricted_view: False
+  view_angle: 70
+  view_range: 4  # in grid units, can be "null"
+  movement_stops_interact: false
+
+effect_manager:
+  FireManager:
+    class: !!python/name:cooperative_cuisine.effects.FireEffectManager ''
+    kwargs:
+      spreading_duration: [ 8, 12 ]
+      fire_burns_ingredients_and_meals: true
+  ConveyerManager:
+    class: !!python/name:cooperative_cuisine.effects.ConveyerManager ''
+    kwargs: {}
+
+hook_callbacks:
+  # # ---------------  Scoring  ---------------
+  orders:
+    hooks: [ completed_order ]
+    callback_class: !!python/name:cooperative_cuisine.scores.ScoreViaHooks ''
+    callback_class_kwargs:
+      time_dependence_func: !!python/name:cooperative_cuisine.scores.constant_score ''
+      time_dependence_kwargs: { }
+      static_score: 100
+      score_on_specific_kwarg: meal_name
+      score_map: { }
+
+  not_ordered_meals:
+    hooks: [ serve_not_ordered_meal ]
+    callback_class: !!python/name:cooperative_cuisine.scores.ScoreViaHooks ''
+    callback_class_kwargs:
+      static_score: 15
+  trashcan_usages:
+    hooks: [ trashcan_usage ]
+    callback_class: !!python/name:cooperative_cuisine.scores.ScoreViaHooks ''
+    callback_class_kwargs:
+      static_score: -5
+  expired_orders:
+    hooks: [ order_expired ]
+    callback_class: !!python/name:cooperative_cuisine.scores.ScoreViaHooks ''
+    callback_class_kwargs:
+      static_score: -10
+    # --------------- Recording ---------------
+  #  json_states:
+  #    hooks: [ json_state ]
+  #    callback_class: !!python/name:cooperative_cuisine.recording.FileRecorder ''
+  #    callback_class_kwargs:
+  #      record_path: USER_LOG_DIR/ENV_NAME/json_states.jsonl
+  actions:
+    hooks: [ pre_perform_action ]
+    callback_class: !!python/name:cooperative_cuisine.recording.FileRecorder ''
+    callback_class_kwargs:
+      record_path: logs/ENV_NAME/LOG_RECORD_NAME.jsonl
+  random_env_events:
+    hooks: [ order_duration_sample, plate_out_of_kitchen_time ]
+    callback_class: !!python/name:cooperative_cuisine.recording.FileRecorder ''
+    callback_class_kwargs:
+      record_path: USER_LOG_DIR/ENV_NAME/LOG_RECORD_NAME.jsonl
+      add_hook_ref: true
+  env_configs:
+    hooks: [ env_initialized, item_info_config ]
+    callback_class: !!python/name:cooperative_cuisine.recording.FileRecorder ''
+    callback_class_kwargs:
+      record_path: USER_LOG_DIR/ENV_NAME/LOG_RECORD_NAME.jsonl
+      add_hook_ref: true
+
+  # Game event recording
+  game_events:
+    hooks:
+      - init_orders
+      - post_counter_pick_up
+      - post_counter_drop_off
+      - post_dispenser_pick_up
+      - cutting_board_100
+      - player_start_interaction
+      - player_end_interact
+      - post_serving
+      - no_serving
+      - dirty_plate_arrives
+      - trashcan_usage
+      - plate_cleaned
+      - added_plate_to_sink
+      - drop_on_sink_addon
+      - pick_up_from_sink_addon
+      - serve_not_ordered_meal
+      - serve_without_plate
+      - completed_order
+      - new_orders
+      - order_expired
+      - action_on_not_reachable_counter
+      - new_fire
+      - fire_spreading
+      - drop_off_on_cooking_equipment
+      - players_collide
+      - post_plate_dispenser_pick_up
+      - post_plate_dispenser_drop_off
+      - drop_off_on_cooking_equipment_plate_dispenser
+      - on_item_transition
+      - progress_started
+      - progress_finished
+      - content_ready
+      - dispenser_item_returned
+      - additional_state_update
+      - game_ended_step
+      - score_changed
+      - fire_extinguished
+      - pick_up_on_cooking_equipment
+
+
+    callback_class: !!python/name:cooperative_cuisine.recording.FileRecorder ''
+    callback_class_kwargs:
+      record_path: game_event/ENV_NAME/LOG_RECORD_NAME.jsonl
+      add_hook_ref: true
+
+
+#  info_msg:
+#    func: !!python/name:cooperative_cuisine.hooks.hooks_via_callback_class ''
+#    kwargs:
+#      hooks: [ cutting_board_100 ]
+#      callback_class: !!python/name:cooperative_cuisine.info_msg.InfoMsgManager ''
+#      callback_class_kwargs:
+#        msg: Glückwunsch du hast was geschnitten!
+#  fire_msg:
+#    func: !!python/name:cooperative_cuisine.hooks.hooks_via_callback_class ''
+#    kwargs:
+#      hooks: [ new_fire ]
+#      callback_class: !!python/name:cooperative_cuisine.info_msg.InfoMsgManager ''
+#      callback_class_kwargs:
+#        msg: Feuer, Feuer, Feuer
+#        level: Warning
