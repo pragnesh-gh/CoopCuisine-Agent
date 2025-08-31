@@ -1,3 +1,7 @@
+# Declaration:
+# This program is the result of ChatGPT.
+
+
 # cocu_base_agents/new_agent/coordinator.py
 """
 Coordinator: a tiny, SQLite-backed lock + claim service for multi-agent coordination.
