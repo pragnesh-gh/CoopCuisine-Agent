@@ -1,3 +1,10 @@
+# Declaration:
+# This program is the result of combined work between a human developer 
+# and ChatGPT. The AI contributed helpers, initial structures, and 
+# formatting improvements. The human developer contributed the 
+# high-level design, behavior tree logic, and integration of ideas. 
+# The final implementation is a product of human–AI collaboration.
+
 import numpy as np
 import py_trees
 from py_trees.decorators import Retry
