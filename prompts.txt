@@ -1,0 +1,53 @@
+Zero Shot: (1)
+----------------------------
+Generate a Python behavior tree using the `py_trees` library for the recipe: {RECIPE_NAME}, following these steps.{STEPS}.  
+The environment is Cooperative Cuisine.  
+Output only valid Python code and do not include explanations, just the code.
+
+Few-Shot: (2 - with 1 and 2 gold BTs)
+----------------------------
+Here is a behavior tree implementation for a recipe in the Cooperative Cuisine environment:
+
+[PASTE GOLD BT EXAMPLE #1]
+
+Based on this, generate a behavior tree for the recipe: {RECIPE_NAME}, following these steps: {STEPS}.  
+Use the same style, formatting, and only the allowed leaf nodes (`GoTo`, `Put`, `Interact`, `MetaCook`, `MarkPlateAddition`, and optional wait/poll nodes).  
+Output only the Python code.
+
+----------------------------
+Here are two behavior tree implementations for recipes in the Cooperative Cuisine environment:
+
+[PASTE GOLD BT EXAMPLE #1]
+
+[PASTE GOLD BT EXAMPLE #2]
+
+Based on these, generate a behavior tree for the recipe: {RECIPE_NAME}, following these steps: {STEPS}.  
+Use the same style, formatting, and only the allowed leaf nodes (`GoTo`, `Put`, `Interact`, `MetaCook`, `MarkPlateAddition`, and optional wait/poll nodes).  
+Output only the Python code.
+----------------------------
+
+System + Role + Contextual: (2)
+----------------------------
+System: You are an expert AI game engineer with 15+ years of experience building production game agents. You think holistically about constraints, efficiency, and robustness.
+
+Role: Generate a VALID behavior tree in Python using the `py_trees` library. Output ONLY Python code (no prose). Use the exact leaves and pacing rules below. Do not invent new leaves or APIs.
+
+Context (Contract – MUST follow):
+Examples of working trees:
+[PASTE ONE OR TWO GOLD BTs HERE IF NEEDED]
+
+Now generate a behavior tree for the recipe: {RECIPE_NAME}, following these steps:
+{STEPS}
+
+Output ONLY the Python code.
+
+
+Chain of Thought (Self-consistency / rationale comments): (1)
+-------------------------
+Generate a Python behavior tree for the recipe: {RECIPE_NAME}, following these steps: {STEPS}, in the Cooperative Cuisine environment using `py_trees`.  
+Before each major subtree, add a one-line comment starting with `# rationale:` explaining why that step is needed.  
+For example:  
+`# rationale: pick tomatoes and chop them before adding to the pot`  
+
+Output only the Python code, with the rationale comments inline.
+
